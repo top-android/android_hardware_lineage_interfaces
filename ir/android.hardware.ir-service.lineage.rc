@@ -5,7 +5,7 @@
 
 on early-boot
     # IR device
-    chown system system /dev/lirc0
+    chown system system /dev/irtx
 
 service vendor.ir-default /vendor/bin/hw/android.hardware.ir-service.lineage
     class hal
