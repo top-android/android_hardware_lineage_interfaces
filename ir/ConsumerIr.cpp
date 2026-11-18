@@ -15,11 +15,55 @@
 
 #include <android-base/logging.h>
 #include <android-base/unique_fd.h>
+#include <hardware/hardware.h>
 #include <ir.sysprop.h>
 
 #include "ConsumerIr.h"
 
 using namespace ::vendor::lineage::ir;
+
+// cannon: vendor 里带 MTK 官方的 consumerir HAL（/vendor/lib64/hw/consumerir.common.so），
+// ro.hardware.consumerir=common 正好让 hw_get_module 找到它。它内部处理了
+// vendor.irtx.hal.mode / duty、buffer 格式、IRTX+PWM 方案选择，比手写协议可靠。
+// 这里直接复用，自写实现只作为兜底。
+typedef struct consumerir_freq_range {
+    int min;
+    int max;
+} consumerir_freq_range_t;
+
+typedef struct consumerir_device {
+    struct hw_device_t common;
+    int (*transmit)(struct consumerir_device* dev, int carrier_freq, const int pattern[],
+                    int pattern_len);
+    int (*get_num_carrier_freqs)(struct consumerir_device* dev);
+    int (*get_carrier_freqs)(struct consumerir_device* dev, size_t len,
+                             consumerir_freq_range_t* ranges);
+    void* reserved[5];
+} consumerir_device_t;
+
+namespace {
+
+consumerir_device_t* getMtkHal() {
+    static consumerir_device_t* sDev = []() -> consumerir_device_t* {
+        const hw_module_t* module = nullptr;
+        int rc = hw_get_module("consumerir", &module);
+        if (rc != 0 || module == nullptr) {
+            LOG(WARNING) << "IRTX: hw_get_module(consumerir) failed: " << rc;
+            return nullptr;
+        }
+        hw_device_t* dev = nullptr;
+        rc = module->methods->open(module, "transmitter", &dev);
+        if (rc != 0 || dev == nullptr) {
+            LOG(WARNING) << "IRTX: consumerir open failed: " << rc;
+            return nullptr;
+        }
+        LOG(INFO) << "IRTX: using MTK consumerir HAL (consumerir.common.so)";
+        return reinterpret_cast<consumerir_device_t*>(dev);
+    }();
+    return sDev;
+}
+
+}  // namespace
 
 namespace aidl {
 namespace android {
@@ -67,10 +111,23 @@ ConsumerIr::ConsumerIr() {
  * Driver sends BUF0_SIZE = count/4 - 2 words to the PWM hardware.
  */
 #define IRTX_IOC_SET_CARRIER_FREQ _IOW('R', 0, unsigned int)
+#define IRTX_IOC_SET_DUTY_CYCLE _IOW('R', 2, unsigned int)
 
 static bool transmitMtk(int fd, int32_t carrierFreqHz, const std::vector<int32_t>& pattern) {
     if (ioctl(fd, IRTX_IOC_SET_CARRIER_FREQ, &carrierFreqHz) < 0) {
         LOG(ERROR) << "IRTX: failed to set carrier " << carrierFreqHz << ", error: " << errno;
+        return false;
+    }
+
+    // cannon: 驱动里 h_l_period = 26MHz * duty / (carrier * cycle)，PWM 周期
+    // = HDURATION + LDURATION = 2 * h_l_period。只有 duty/cycle = 1/2 时
+    // 2 * h_l_period 才等于 26MHz/carrier（请求的载频本身）。
+    // 不设的话驱动默认 cycle=3、duty=1，载频会变成 1.5 倍（38k 请求实际
+    // 输出 57 kHz），且 buffer 每个 bit 的时间也跟着缩水 1/3。
+    // 对应 dmesg：不设时 period:228（错），设完应为 period:342（26MHz/38k/2）。
+    unsigned int duty = (1u << 16) | 2u; // duty_cycle=1, cycle=2 → 50%
+    if (ioctl(fd, IRTX_IOC_SET_DUTY_CYCLE, &duty) < 0) {
+        LOG(ERROR) << "IRTX: failed to set duty cycle, error: " << errno;
         return false;
     }
 
@@ -156,6 +213,16 @@ static bool transmitLirc(int fd, int32_t carrierFreqHz, const std::vector<int32_
     if (!isInRange(carrierFreqHz)) {
         LOG(ERROR) << "Unsupported carrier " << carrierFreqHz;
         return ::ndk::ScopedAStatus::fromExceptionCode(EX_UNSUPPORTED_OPERATION);
+    }
+
+    // cannon: 优先走 MTK 官方 consumerir HAL
+    if (consumerir_device_t* dev = getMtkHal()) {
+        int rc = dev->transmit(dev, carrierFreqHz, pattern.data(),
+                               static_cast<int>(pattern.size()));
+        if (rc == 0) {
+            return ::ndk::ScopedAStatus::ok();
+        }
+        LOG(WARNING) << "IRTX: MTK HAL transmit rc=" << rc << ", falling back";
     }
 
     ::android::base::unique_fd fd(open(kIrDevice.c_str(), O_WRONLY));

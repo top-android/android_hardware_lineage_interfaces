@@ -16,6 +16,8 @@ cc_binary {
     shared_libs: [
         "libbase",
         "libbinder_ndk",
+        "libhardware",
+        "liblog",
         "android.hardware.ir-V1-ndk",
     ],
     static_libs: [
